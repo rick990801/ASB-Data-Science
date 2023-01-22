@@ -1,0 +1,343 @@
+---
+title: "Data Science Challenge"
+author: "Richard Choi"
+date: '2023-01-19'
+output:
+  html_document:
+    df_print: paged
+---
+
+Today is December 01, 2020. You work for Vac-Attack which sells High-End Vacuums. You 
+are asked by the General Manager of Sales to use the historical data to create a Forecast of 
+sales expected December 2020 as well as the total expected for the month. This will help 
+them to determine whether the company will meet it’s targets and ensures the stock on 
+hand matches demand. 
+
+hand matches demand. You are also asked to derive any insights from your model or the
+data; especially around advertising spend.
+
+Vac-Attack is primarily an As-Seen-On-TV business and therefore the majority of advertising 
+is TV based. The Marketing team has said that the Marketing Mix for advertising has 
+changed a little as the business has gone more digital. The Marketing team also believe the 
+release of the Ultra Edition Vac was received positively and generated more sales.
+Vac-Attack sells through an 0508 number and their website.
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tsibble)
+library(lubridate)
+library(fpp3)
+library(forecast)
+library(GGally)
+```
+
+```{r}
+# read data
+
+# we notice there is no column names in the dataset
+
+DecemberAdData = read_csv("DecemberAdData.csv", col_names = FALSE)
+DecemberCols = read_csv("DecemberCols.csv", col_names = FALSE)
+MarketingCols = read_csv("MarketingCols.csv", col_names = FALSE)
+MarketingSales = read_csv("MarketingSales.csv", col_names = FALSE)
+
+# add the column names into the dataset
+for (i in DecemberCols) {
+  colnames(DecemberAdData) = i
+  
+}
+
+for (i in MarketingCols) {
+  colnames(MarketingSales) = i
+  
+}
+
+
+```
+
+```{r}
+DecemberAdData %>% 
+  head()
+
+DecemberAdData.tidy =DecemberAdData %>% 
+  group_by(Day) %>%
+  summarise(mean_advertising = mean(AdvertisingSpend))
+
+DecemberAdData.tidy$Day = factor(DecemberAdData.tidy$Day, levels=c("Monday", "Tuesday", "Wednesday", "Thursday", 
+"Friday", "Saturday", "Sunday"))
+
+DecemberAdData.tidy %>%
+  ggplot(aes(x=Day, y=mean_advertising)) + geom_bar(stat='identity') + labs(y= "Mean Ad Cost") + ggtitle("Mean Ad Cost By Days in December 2020") + theme(plot.title = element_text(hjust = 0.5))
+
+
+
+```
+
+We can see that Tuesday has the highest mean advertisement cost and Friday has the lowest mean advertisement cost.
+
+```{r}
+
+# change the data format
+MarketingSales.tidy = MarketingSales
+MarketingSales.tidy$Date = dmy(MarketingSales.tidy$Date)
+
+MarketingSales.tidy %>% tail()
+
+sales.tsibble = MarketingSales.tidy %>%
+  as_tsibble(index=(Date))
+
+```
+```{r}
+sales.tsibble %>%
+  ggpairs(column = c(2, 3, 4, 5, 8, 9, 10, 11))
+
+```
+
+We see the biggest correlation coefficient with covid lockdown and advertising cost for sales. We explore their relationships in bit more detail.
+
+
+```{r}
+sales.tsibble %>%
+  ggplot(aes(Date, Sales, color=weekdays(Date) %in% c("Saturday", "Sunday"))) + geom_point(na.rm=TRUE) + scale_color_discrete(name="Is Weekend") + 
+  ggtitle("Daily unit sales of High-End Vaccums in Vac-Attack from 2016 to 2020") + xlab("Year") +
+  ylab("Sales")
+
+sales.tsibble %>%
+  autoplot(Sales) + ylab("Sales") + xlab("Year") + 
+  ggtitle("Daily unit sales of High-End Vaccums in Vac-Attack") + theme(plot.title = element_text(hjust = 0.5))
+
+# checking if all the sales is positive
+all(sales.tsibble$Sales > 0)
+
+# box cox transformation
+lambda <- sales.tsibble %>%
+  features(Sales, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+lambda
+
+sales.tsibble %>% 
+  autoplot(box_cox(Sales, 0.5)) + 
+  ggtitle("Daily unit sales of High-End Vaccums in Vac-Attack") + theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+We see that there doesn't seem to be increase in sales whether it's weekend or not. We can assume that customers orders high-end vacuums equally through the week.
+
+We can see a non-linear trend and increase in seasonality variation as year passes. We can apply a transformation to stabilise the variability. Using the automatic approach, we got the lambda of 0.54. It looks much more stabilised.
+
+For the purpose of interpretability, we will be using lambda of 0.5 where it's simply square root transformation.
+The transformed data looks more constant in seasonal variability.
+
+
+```{r}
+covid = sales.tsibble %>%
+  filter(COVID_Lockdown == 1 | (Date >= "2019-03-25" & Date <= "2019-05-15")) %>%
+  group_by(COVID_Lockdown) %>%
+  summarise(mean_sales = mean(Sales))
+
+min(covid$Date)
+max(covid$Date)
+
+covid$COVID_Lockdown = factor(covid$COVID_Lockdown, levels=c("0", "1"))
+
+covid %>%
+  ggplot(aes(x=as.factor(COVID_Lockdown), y=mean_sales)) + geom_bar(stat='identity') + labs(y= "Mean Sales") + ggtitle("Impact of covid lockdown in sales") + theme(plot.title = element_text(hjust = 0.5)) + xlab("Covid Lockdown")
+```
+
+There also seems to be significant drop in sales during the covid lockdown where we compare the time interval with last year's.
+
+```{r}
+# Let's make a training data
+sales.tsibble_training = sales.tsibble %>%
+  filter(Date <= '2020-5-30')
+
+# Let's make a test data
+sales.tsibble_test = sales.tsibble %>%
+  filter(Date > '2020-5-30')
+```
+
+We notice that the covid lockdown was imposed from 2020-3-25 to 2020-5-15. To account for the impact of covid and its impact on new normal, I'll be using till 2020-5-31 for the training data instead of till 2020-5-15.
+
+Test data set was made from 2020-06-01.
+
+```{r}
+# Forecast of sales using Seasonal Naive Method with box cox tranformation
+sales.tsibble_training %>% 
+  filter(!is.na(Sales)) %>%
+  model(SNAIVE(box_cox(Sales, lambda = 0.5) ~ drift())) %>%
+  forecast(h = "6 months") %>%
+  autoplot(sales.tsibble_training)
+
+SnaiveFit = sales.tsibble_training %>% 
+  filter(!is.na(Sales)) %>%
+  model(SNAIVE(box_cox(Sales, lambda = 0.5) ~ drift()))
+
+SnaiveFit %>%
+  gg_tsresiduals()
+
+SnaiveFc = SnaiveFit %>%
+  forecast(h = "6 months", lambda=0.5, biasadj=TRUE, level=95)
+
+SnaiveFc %>%
+  autoplot(sales.tsibble_test, level=NULL) + ggtitle("Forecast against Actual Data for Sales June 2020 to Nov 2020") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Seasonal Naive Method was chosen because we see a decreasing trend and a strong seasonal component. Box-cox transformation was also applied to stabilise as the variation change proportional to the level of series.
+
+The residual plot is not the best but it's centred around zero with approximate constant variance. There are large residuals due to the covid lockdown around year 2020. The first three residual autocorrelation and 6th to 10th residual autocorrelation are statistically significant. This means that the model hasn't captured the inherent autocorrelation strucuture well. The histogram is ok, it looks normal.
+
+We have overlayed our forecast in blue line to the training data and it's not a bad fit.
+
+```{r}
+# Forecast of sales using Holt's Winter Model
+HoltWinterTraining = sales.tsibble_training %>%
+  model(ETS(Sales~ error("A") + trend("A") + season("A"))) 
+
+HoltWinterTraining %>%
+  gg_tsresiduals()
+
+HoltWinterFc = HoltWinterTraining %>%
+  forecast(h="6 months") 
+
+HoltWinterFc %>%
+  autoplot(sales.tsibble_training)
+
+HoltWinterTraining %>% report()
+
+HoltWinterFc %>%
+  autoplot(sales.tsibble_test, level=NULL) + ggtitle("Forecast against Actual Data for Sales June 2020 to Nov 2020") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+We are using the Holt's Winter Additive Model because we are observing seasonal variations are roughly constant through the series.
+
+The residual plot shows large residual points than the seasonal naive's residual plot where it ranges from -40 to 40. It's overall centred around zero with approximate constant variance. The fourth residual autocorrelation is statistically significant by large. This means that the model hasn't captured the inherent autocorrelation structure well. The histogram is okay, it looks normal.
+
+We have overlayed our forecast in blue line to the training data and it's a poor fit.
+
+```{r}
+# Finding the accuracy of forecast against the actual values
+accuracy(SnaiveFc, sales.tsibble)
+accuracy(HoltWinterFc, sales.tsibble)
+
+SnaiveFcDec = sales.tsibble_test %>% 
+  filter(!is.na(Sales)) %>%
+  model(SNAIVE(box_cox(Sales, lambda = 0.5) ~ drift())) %>%
+  forecast(h = "31 days", lambda=0.5, biasadj=TRUE, level=95)
+
+sum(SnaiveFcDec$.mean)
+```
+
+The accuracy of the forecast against the actual values, we can see that the root mean squared error is 15.51 for Seasonal Naive model, and root mean squared error is 25.75 for Holt Winter's model. RMSE tells us the distance between the predicted value by the model and the actual value. Seasonal Naive model gives us lower RMSE so we will be using that model to forecast for December sales.
+
+Holt-Winter's Additive Model uses exponential smoothing. The prior observations are weighted in progressively decreasing order in exponential smoothing. This means that the recent observations are given more weight than values that are far away. In this case, it makes a bad forecast when comparing with the real value. 
+
+Seasonal Naive method has a shortcoming too. If the most recent observation was not representative of the dataset then the method would not be able to capture the seasonality. The advantage of the model is that it is both easy to understand and to implement.
+
+The model predicts 3274.14 units sold on average which is lower than the company's aim to sell 3,900 units in December.
+
+```{r}
+DecemberAdData$Date = dmy(DecemberAdData$Date)
+
+sales.tsibble_dec = DecemberAdData %>%
+  add_column(PositiveNews=0, 
+             NegativeCoverage = 0,
+             Competition=0,
+             `0508Line_247`=0,
+             UltraEdition_Available=1,
+             COVID_Lockdown=0,
+             Sales=SnaiveFcDec$.mean,
+             ) %>%
+  as_tsibble(index=Date)
+
+# generate sales december forecast in csv file. Be sure to change the file location!
+write_csv(sales.tsibble_dec, "C://Users//GGPC//OneDrive//Documents//SalesDecForecast.csv")
+
+# merge the historical data with the forecasted data
+all_sales.tsibble = bind_rows(sales.tsibble, sales.tsibble_dec)
+```
+
+```{r}
+sales.tsibble_dec %>%
+  ggpairs(columns = c(2, 11))
+
+sales.tsibble %>%
+  ggpairs(columns = c(5, 11))
+
+```
+
+Due to the relatively low size of the forecast data, we don't see much observations. However, we see a roughly increasing relationship between advertising cost and sales. Likewise, we also see a positive relationship between them in the historical data.
+
+```{r fig.height=10, fig.width=15}
+# Let's have a look at the advertising cost by year
+
+sales.tsibble %>%
+  ggplot(aes(x=Date, y=AdvertisingSpend, color=as.factor(year(Date)))) +
+  geom_line() + ylab("Advertising Cost") + xlab("Year") + labs(color="Year") +
+  facet_wrap(~year(Date), scales='free') + ggtitle("Daily Advertising Cost of High-End Vaccums in Vac-Attack by Year") + theme(plot.title = element_text(hjust = 0.5))
+
+sales.tsibble %>%
+  filter(AdvertisingSpend > 35000)
+```
+
+We are looking at the advertising cost throughout the year and there doens't seem to be a significant change. We see that year 2016 and 2018 have the highest adveritising cost. More information would be required to dive further.
+
+```{r}
+# Let's have a look at advertising cost
+
+sales.tsibble %>%
+  ggplot(aes(Date, AdvertisingSpend, color=weekdays(Date) %in% c("Saturday", "Sunday"))) + geom_point(na.rm=TRUE) + scale_color_discrete(name="Is Weekend") + 
+  ggtitle("Daily Advertising Cost of High-End Vaccums in Vac-Attack from 2016 to 2020") + theme(plot.title = element_text(hjust = 0.5)) + xlab("Year") + ylab("Advertising Cost")
+
+sales.tsibble %>%
+  autoplot(AdvertisingSpend) + ylab("Advertising Cost") + xlab("Year") + 
+  ggtitle("Daily Advertising Cost of High-End Vaccums in Vac-Attack") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Like the sales, the advertising cost also seems constant whether it's weekend or not.
+
+```{r}
+# Seasonal Plot
+
+sales.tsibble %>%
+  filter(year(Date) == "2019") %>%
+  gg_season(AdvertisingSpend, period="month") + ggtitle("Seasonal plot for Advertising Cost of High-End Vaccums in Vac-Attack 2019") + 
+  ylab("Advertising Cost") + xlab("Month")
+
+sales.tsibble %>%
+  filter(year(Date) == "2019") %>%
+  gg_season(AdvertisingSpend, period="week") + ggtitle("Seasonal plot for Advertising Cost of High-End Vaccums in Vac-Attack 2019") + 
+  ylab("Advertising Cost") + xlab("Week")
+
+```
+
+Looking at the seasonal plot, there also doesn't seem be any pattern for advertising cost by Month. Year 2019 was chosen because of it was most recent year before the covid impact. Most notable months for advertising cost seems to be August and December.
+
+```{r}
+sales.tsibble_tidy =sales.tsibble %>% 
+  group_by(Day) %>%
+  summarise(mean_advertising = mean(AdvertisingSpend))
+
+sales.tsibble_tidy$Day = factor(sales.tsibble_tidy$Day, levels=c("Monday", "Tuesday", "Wednesday", "Thursday", 
+"Friday", "Saturday", "Sunday"))
+
+sales.tsibble_tidy %>%
+  ggplot(aes(x=Day, y=mean_advertising)) + geom_bar(stat='identity') + labs(y= "Mean Ad Cost") + ggtitle("Mean Ad Cost By Days from Jan 2016 to Nov 2020") + theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+We don't see much of a pattern. Notable findings are, on average Wednesday has the lowest mean advertisement cost, and Tuesday has the highest advertisement cost.
+
+# Conclusion
+
+The Seasonal Naive model forecasts 3274 units sold whereas the company aims to sell 3900 in December. The underestimation could arise from the recent impact on Covid lockdown where the model wasn't exposed as much to the time period of post covid lockdown. The overlay with the forecasted values and the actual value shows underestimation. 
+
+Based on the model, it looks like the company will not be able to meet its target and the company may have more inventories than they should. The forecast for December sales has been generated in csv file for the marketing team to make use of it.
+
+We found that there is a positive relationship between advertising cost and the sales we generate. The advertising cost doesn't seem to be impacted too much by the seasonality in terms of weekly, and monthly. By daily, the advertisement cost seems to be the lowest on Wednesday and the highest on Tuesday, more studies should be conducted to find out.
+
+
+
+
